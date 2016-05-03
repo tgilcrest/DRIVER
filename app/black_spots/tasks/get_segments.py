@@ -1,4 +1,5 @@
 import fiona
+from fiona.crs import from_epsg
 import itertools
 import logging
 import os
@@ -38,24 +39,27 @@ RECORD_COL_OCCURRED = os.getenv('RECORD_COL_OCCURRED', 'occurred_from')
 RECORD_COL_SEVERE = os.getenv('RECORD_COL_SEVERE', 'Severity')
 RECORD_COL_SEVERE_VALS = os.getenv('RECORD_COL_SEVERE_VALS', 'Fatal,Injury')
 RECORD_COL_PRECIP = os.getenv('RECORD_COL_PRECIP', 'weather')
-RECORD_COL_PRECIP_VALS = os.getenv('RECORD_COL_PRECIP_VALS', 'rain,hail,sleet,snow,thunderstorm,tornado')
+RECORD_COL_PRECIP_VALS = os.getenv('RECORD_COL_PRECIP_VALS',
+                                   'rain,hail,sleet,snow,thunderstorm,tornado')
 COMBINED_SEGMENTS_SHP_NAME = os.getenv('COMBINED_SEGMENTS_SHP_NAME', 'combined_segments.shp')
 TILE_MAX_UNITS = int(os.getenv('TILE_MAX_UNITS', '3000'))
 
 
 @shared_task
-def get_segments_shp(path_to_roads_shp):
+def get_segments_shp(path_to_roads_shp, road_srid):
     """Save segments to a shapefile and save in model
 
     Args:
     :param path_to_roads_shp: (str) path to shapefile
+    :param road_srid: (int) EPSG ID of roads shapefile projection
     """
     try:
         logger.info('Reading Roads Shapefile: %s', path_to_roads_shp)
-        roads, road_projection, road_bounds = read_roads(path_to_roads_shp)
+        roads, road_bounds = read_roads(path_to_roads_shp)
 
         logger.info('Obtaining intersection buffers')
-        int_buffers = get_intersection_buffers(roads, road_bounds, INTERSECTION_BUFFER_UNITS, TILE_MAX_UNITS)
+        int_buffers = get_intersection_buffers(roads, road_bounds, INTERSECTION_BUFFER_UNITS,
+                                               TILE_MAX_UNITS)
 
         logger.info('Obtaining intersections')
         int_multilines, non_int_lines = get_intersection_parts(roads, int_buffers, MAX_LINE_UNITS)
@@ -66,7 +70,7 @@ def get_segments_shp(path_to_roads_shp):
         tar_output_dir = tempfile.mkdtemp()
 
         segments_shp_path = os.path.join(shp_output_dir, COMBINED_SEGMENTS_SHP_NAME)
-        write_segments_shp(segments_shp_path, road_projection, combined_segments)
+        write_segments_shp(segments_shp_path, road_srid, combined_segments)
         tarball_path = create_tarball(shp_output_dir, tar_output_dir)
 
         road_segments_shpfile = RoadSegmentsShapefile.objects.create()
@@ -119,7 +123,7 @@ def get_intersections(roads):
             elif 'MultiLineString' == intersection.type:
                 multiLine = [line for line in intersection]
                 first_coords = multiLine[0].coords[0]
-                last_coords = multiLine[len(multiLine)-1].coords[1]
+                last_coords = multiLine[len(multiLine) - 1].coords[1]
                 intersections.append(Point(first_coords[0], first_coords[1]))
                 intersections.append(Point(last_coords[0], last_coords[1]))
             elif 'GeometryCollection' == intersection.type:
@@ -135,6 +139,22 @@ def get_intersections(roads):
     return unioned
 
 
+def should_keep_road(road):
+    """Returns true if road should be considered for segmentation"""
+    if ('highway' in road['properties']
+            and road['properties']['highway'] is not None
+            and road['properties']['highway'] != 'path'
+            and road['properties']['highway'] != 'footway'):
+        return True
+    # We're only interested in non-bridge, non-tunnel highways
+    # 'class' is optional, so only consider it when it's available.
+    if ('class' not in road['properties'] or road['properties']['class'] == 'highway'
+            and road['properties']['bridge'] == 0
+            and road['properties']['tunnel'] == 0):
+        return True
+    return False
+
+
 def read_roads(roads_shp):
     """Reads shapefile and extracts roads and projection
     :param roads_shp: Path to the shapefile containing roads
@@ -143,13 +163,10 @@ def read_roads(roads_shp):
     roads = [
         shape(road['geometry'])
         for road in shp_file
-        # We're only interested in non-bridge, non-tunnel highways
-        # 'class' is optional, so only consider it when it's available.
-        if ('class' not in road['properties'] or road['properties']['class'] == 'highway'
-            and road['properties']['bridge'] == 0
-            and road['properties']['tunnel'] == 0)
+
+        if should_keep_road(road)
     ]
-    return (roads, shp_file.crs, shp_file.bounds)
+    return (roads, shp_file.bounds)
 
 
 def get_intersection_buffers(roads, road_bounds, intersection_buffer_units, tile_max_units):
@@ -276,10 +293,10 @@ def get_intersection_parts(roads, int_buffers, max_line_units):
     return (int_multilines, split_non_int_lines)
 
 
-def write_segments_shp(segments_shp_path, road_projection, segments):
+def write_segments_shp(segments_shp_path, road_srid, segments):
     """Writes all segments to shapefile (both intersections and individual segments)
     :param segments_shp_path: Path to shapefile to write
-    :param road_projection: Projection of road data
+    :param road_srid: EPSG ID of projection of road data
     :param segments_with_data: List of tuples containing segments and segment data
     """
 
@@ -301,9 +318,11 @@ def write_segments_shp(segments_shp_path, road_projection, segments):
         }
     }
 
+    count = 0
+    print("Opening shapefile for output")
     with fiona.open(segments_shp_path, 'w', driver='ESRI Shapefile',
-                    schema=schema, crs=road_projection) as output:
-
+                    schema=schema, crs=from_epsg(road_srid)) as output:
+        print("Beginning to write segments")
         for idx, segment in enumerate(segments):
             is_intersection = 'MultiLineString' == segment.type
             data = {
